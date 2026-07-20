@@ -1,0 +1,77 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum RolUsuario {
+  ADMIN
+  SUPERVISOR
+  TECNICO
+  SECRETARIA
+}
+
+model Usuario {
+  id        String     @id @default(uuid())
+  nombre    String
+  apellido  String
+  email     String     @unique
+  password  String
+  rol       RolUsuario @default(ADMIN)
+  activo    Boolean    @default(true)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  tokensSesion TokenSesion[]
+
+  @@map("usuarios")
+}
+
+model TokenSesion {
+  id        String   @id @default(uuid())
+  usuarioId String
+  usuario   Usuario  @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  dispositivo String?
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+
+  @@map("tokens_sesion")
+}
+
+model Producto {
+  id                Int      @id
+  nombre            String
+  codigo            String?
+  categoria         String?
+  unidad            String?
+  descripcion       String?
+  esMedible         Boolean  @default(false)
+  metrosPorUnidad   Float?
+  metrosDisponibles Float?
+  tieneVariantes    Boolean  @default(false)
+  estado            Boolean  @default(true)
+  stockTotal        Int      @default(0)
+  stockMinimo       Int      @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  variantes ProductoVariante[]
+
+  @@map("productos")
+}
+
+model ProductoVariante {
+  id         String   @id @default(uuid())
+  productoId Int
+  producto   Producto @relation(fields: [productoId], references: [id], onDelete: Cascade)
+  genero     String?
+  talla      String?
+  codigo     String?
+  createdAt  DateTime @default(now())
+
+  @@map("producto_variantes")
+}
