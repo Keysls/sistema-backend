@@ -62,7 +62,7 @@ async function categorias(req, res) {
 // POST /api/productos
 async function crear(req, res) {
   try {
-    const { nombre, codigo, categoria, unidad, descripcion, es_medible, metros_por_unidad, tiene_variantes } = req.body;
+    const { nombre, codigo, categoria, unidad, descripcion, es_medible, metros_por_unidad, tiene_variantes, stock_minimo } = req.body;
 
     if (!nombre?.trim()) {
       return res.status(400).json({ error: 'El nombre es requerido' });
@@ -82,6 +82,7 @@ async function crear(req, res) {
         esMedible: Boolean(es_medible),
         metrosPorUnidad: metros_por_unidad ? Number(metros_por_unidad) : null,
         tieneVariantes: Boolean(tiene_variantes),
+        stockMinimo: stock_minimo ? Number(stock_minimo) : 0,
       },
     });
 
@@ -96,7 +97,7 @@ async function crear(req, res) {
 async function actualizar(req, res) {
   try {
     const id = parseInt(req.params.id, 10);
-    const { nombre, codigo, categoria, unidad, descripcion, es_medible, metros_por_unidad, tiene_variantes } = req.body;
+    const { nombre, codigo, categoria, unidad, descripcion, es_medible, metros_por_unidad, tiene_variantes, stock_minimo } = req.body;
 
     const producto = await prisma.producto.update({
       where: { id },
@@ -109,6 +110,7 @@ async function actualizar(req, res) {
         esMedible: Boolean(es_medible),
         metrosPorUnidad: metros_por_unidad ? Number(metros_por_unidad) : null,
         tieneVariantes: Boolean(tiene_variantes),
+        stockMinimo: stock_minimo !== undefined && stock_minimo !== '' ? Number(stock_minimo) : 0,
       },
     });
 

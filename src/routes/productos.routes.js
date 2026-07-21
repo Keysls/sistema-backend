@@ -10,9 +10,9 @@ const {
   actualizarVariante,
   eliminarVariante,
 } = require('../controllers/productos.controller');
-const { verificarToken } = require('../middleware/auth.middleware');
+const { verificarToken, verificarTokenCualquiera } = require('../middleware/auth.middleware');
 
-router.get('/catalogo', verificarToken, catalogo);
+router.get('/catalogo', verificarTokenCualquiera, catalogo);
 router.get('/categorias', verificarToken, categorias);
 router.post('/', verificarToken, crear);
 router.put('/:id', verificarToken, actualizar);

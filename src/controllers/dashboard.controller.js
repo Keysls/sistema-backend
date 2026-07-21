@@ -3,13 +3,32 @@ const prisma = require('../utils/prisma');
 // GET /api/dashboard/kpis
 async function kpis(req, res) {
   try {
-    // TODO: reemplazar con sumas reales cuando exista el modelo de Ordenes/Ventas
+    const hoy = new Date();
+    const inicioMes = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
+    const inicioMesSiguiente = new Date(hoy.getFullYear(), hoy.getMonth() + 1, 1);
+
+    const [cargosPendientes, pagosMes, contratosActivos] = await Promise.all([
+      prisma.cargoMensual.findMany({
+        where: { estado: 'PENDIENTE' },
+        select: { monto: true, contratoId: true, contrato: { select: { clienteId: true } } },
+      }),
+      prisma.pago.aggregate({
+        where: { fecha: { gte: inicioMes, lt: inicioMesSiguiente } },
+        _sum: { monto: true },
+      }),
+      prisma.contrato.count({ where: { estado: 'ACTIVO' } }),
+    ]);
+
+    const deudaTotal = cargosPendientes.reduce((acc, c) => acc + Number(c.monto), 0);
+    const clientesConDeuda = new Set(cargosPendientes.map(c => c.contrato?.clienteId)).size;
+    const recaudadoMes = Number(pagosMes._sum.monto || 0);
+
     res.json({
       data: {
-        ventasHoy: 0,
-        ventasSemana: 0,
-        ventasMes: 0,
-        ordenesAbiertas: 0,
+        clientesConDeuda,
+        deudaTotal,
+        recaudadoMes,
+        contratosActivos,
       },
     });
   } catch (err) {
@@ -19,23 +38,58 @@ async function kpis(req, res) {
 }
 
 // GET /api/dashboard/analitica?periodo=7d
-function generarPuntos(periodo) {
-  const CONFIG = {
-    '3d': 3, '7d': 7, '30d': 30, '6m': 6, '1a': 12,
-  };
-  const n = CONFIG[periodo] || 7;
-  const esMensual = periodo === '6m' || periodo === '1a';
-
-  return Array.from({ length: n }, (_, i) => ({
-    label: esMensual ? `Mes ${i + 1}` : `Día ${i + 1}`,
-    monto: 0, // TODO: reemplazar con suma real agrupada por fecha
-  }));
+function inicioPeriodo(periodo, ahora) {
+  const CONFIG_DIAS = { '3d': 3, '7d': 7, '30d': 30 };
+  const CONFIG_MESES = { '6m': 6, '1a': 12 };
+  if (CONFIG_DIAS[periodo] != null) {
+    const dias = CONFIG_DIAS[periodo];
+    const inicio = new Date(ahora.getFullYear(), ahora.getMonth(), ahora.getDate() - (dias - 1));
+    return { inicio, esMensual: false, cantidad: dias };
+  }
+  const meses = CONFIG_MESES[periodo] || 6;
+  const inicio = new Date(ahora.getFullYear(), ahora.getMonth() - (meses - 1), 1);
+  return { inicio, esMensual: true, cantidad: meses };
 }
 
 async function analitica(req, res) {
   try {
     const { periodo = '7d' } = req.query;
-    res.json({ data: generarPuntos(periodo) });
+    const ahora = new Date();
+    const { inicio, esMensual, cantidad } = inicioPeriodo(periodo, ahora);
+
+    const pagos = await prisma.pago.findMany({
+      where: { fecha: { gte: inicio } },
+      select: { fecha: true, monto: true },
+    });
+
+    const puntos = [];
+    if (!esMensual) {
+      for (let i = 0; i < cantidad; i++) {
+        const dia = new Date(inicio.getFullYear(), inicio.getMonth(), inicio.getDate() + i);
+        const siguiente = new Date(dia.getFullYear(), dia.getMonth(), dia.getDate() + 1);
+        const monto = pagos
+          .filter(p => p.fecha >= dia && p.fecha < siguiente)
+          .reduce((acc, p) => acc + Number(p.monto), 0);
+        puntos.push({
+          label: dia.toLocaleDateString('es-PE', { day: '2-digit', month: 'short' }),
+          monto,
+        });
+      }
+    } else {
+      for (let i = 0; i < cantidad; i++) {
+        const mes = new Date(inicio.getFullYear(), inicio.getMonth() + i, 1);
+        const siguiente = new Date(mes.getFullYear(), mes.getMonth() + 1, 1);
+        const monto = pagos
+          .filter(p => p.fecha >= mes && p.fecha < siguiente)
+          .reduce((acc, p) => acc + Number(p.monto), 0);
+        puntos.push({
+          label: mes.toLocaleDateString('es-PE', { month: 'short', year: '2-digit' }),
+          monto,
+        });
+      }
+    }
+
+    res.json({ data: puntos });
   } catch (err) {
     console.error('Error en dashboard.analitica:', err);
     res.status(500).json({ error: 'Error al obtener analítica' });
@@ -45,8 +99,27 @@ async function analitica(req, res) {
 // GET /api/dashboard/historial
 async function historial(req, res) {
   try {
-    // TODO: reemplazar con las últimas 5 órdenes reales
-    res.json({ data: [] });
+    const ordenes = await prisma.ordenServicio.findMany({
+      orderBy: { fechaServicio: 'desc' },
+      take: 5,
+      select: {
+        nServicio: true, tipoOrden: true, estado: true, abonado: true, fechaServicio: true, fechaFin: true,
+        tecnico: { select: { nombre: true, apellido: true } },
+        contrato: { select: { tipoServicio: true } },
+      },
+    });
+
+    res.json({
+      data: ordenes.map(o => ({
+        numeroOrden: o.nServicio,
+        cliente: o.abonado,
+        tecnico: o.tecnico ? `${o.tecnico.nombre} ${o.tecnico.apellido}` : '—',
+        tipoOrden: o.tipoOrden,
+        estado: o.estado,
+        fecha: o.fechaServicio,
+        fechaFin: o.fechaFin,
+      })),
+    });
   } catch (err) {
     console.error('Error en dashboard.historial:', err);
     res.status(500).json({ error: 'Error al obtener historial' });

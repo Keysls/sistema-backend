@@ -14,6 +14,75 @@ enum RolUsuario {
   SECRETARIA
 }
 
+enum TipoServicio {
+  INTERNET
+  CABLE
+  DUO
+}
+
+enum EstadoContrato {
+  ACTIVO
+  SUSPENDIDO
+  CORTADO
+  BAJA
+}
+
+enum EstadoOrden {
+  PENDIENTE
+  ASIGNADA
+  EN_PROCESO
+  COMPLETADA
+  CANCELADA
+}
+
+enum TipoOrden {
+  // ── Internet ──────────────────────────────
+  INSTALACION_I
+  ALTA_SERVICIO_I
+  ATENCION_NOC_I
+  AVERIA_I
+  BAJA_SERVICIO_I
+  CAMBIO_CONTRASENA_I
+  CAMBIO_DOMICILIO_I
+  CAMBIO_EQUIPO_I
+  CAMBIO_PLAN_I
+  CAMBIO_TITULAR_I
+  CORTE_SOLICITUD_I
+  CORTE_DEUDA_I
+  RECONEXION_I
+  RETIRO_EQUIPO_I
+  TRASLADO_I
+  // ── Cable ─────────────────────────────────
+  INSTALACION_C
+  ALTA_SERVICIO_C
+  AVERIA_C
+  CAMBIO_DOMICILIO_C
+  CAMBIO_PLAN_C
+  CAMBIO_TITULAR_C
+  CORTE_SOLICITUD_C
+  CORTE_DEUDA_C
+  INSTALACION_ANEXO_C
+  MIGRACION_FTTH_C
+  RECONEXION_C
+  RETIRO_EQUIPO_C
+  SUPERVISION_C
+  TRASLADO_C
+  // ── Dúo (Internet + Cable) ────────────────
+  INSTALACION_D
+  ALTA_SERVICIO_D
+  AVERIA_D
+  CAMBIO_DOMICILIO_D
+  CAMBIO_EQUIPO_D
+  CAMBIO_PLAN_D
+  CAMBIO_TITULAR_D
+  CORTE_SOLICITUD_D
+  CORTE_DEUDA_D
+  RECONEXION_D
+  RETIRO_EQUIPO_D
+  TRASLADO_D
+  BAJA_SERVICIO_D
+}
+
 model Usuario {
   id        String     @id @default(uuid())
   nombre    String
@@ -26,6 +95,8 @@ model Usuario {
   updatedAt DateTime   @updatedAt
 
   tokensSesion TokenSesion[]
+  pagosRegistrados Pago[]
+  egresos          Egreso[]
 
   @@map("usuarios")
 }
@@ -60,8 +131,24 @@ model Producto {
   updatedAt         DateTime @updatedAt
 
   variantes ProductoVariante[]
+  movimientos MovimientoStock[]
+  contratos   Contrato[]
+  consumos    OrdenConsumo[]
 
   @@map("productos")
+}
+
+model MovimientoStock {
+  id          String   @id @default(uuid())
+  productoId  Int
+  producto    Producto @relation(fields: [productoId], references: [id])
+  tipo        String   // 'ENTRADA' | 'SALIDA'
+  cantidad    Float
+  proveedor   String?
+  motivo      String?
+  createdAt   DateTime @default(now())
+
+  @@map("movimientos_stock")
 }
 
 model ProductoVariante {
@@ -74,4 +161,327 @@ model ProductoVariante {
   createdAt  DateTime @default(now())
 
   @@map("producto_variantes")
+}
+
+model Tecnico {
+  id        String   @id @default(uuid())
+  nombre    String
+  apellido  String
+  dni       String   @unique
+  telefono  String?
+  email     String   @unique
+  password  String
+  zona      String?
+  vehiculo  String?
+  activo    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  contratosInstalados Contrato[]
+  ordenesAsignadas    OrdenServicio[]
+
+  @@map("tecnicos")
+}
+
+model Secretario {
+  id        String   @id @default(uuid())
+  nombre    String
+  apellido  String
+  dni       String   @unique
+  telefono  String?
+  email     String   @unique
+  password  String
+  activo    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("secretarios")
+}
+
+model Cliente {
+  id         String   @id @default(uuid())
+  dniRuc     String   @unique
+  nombres    String
+  apellidos  String?
+  telefono   String?
+  email      String?
+  direccion  String?
+  latitud    Float?
+  longitud   Float?
+  activo     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  contratos Contrato[]
+
+  @@map("clientes")
+}
+
+model PuntoRed {
+  id         String   @id @default(uuid())
+  tipo       String   // 'NAP' | 'CTO'
+  codigo     String   @unique
+  latitud    Float
+  longitud   Float
+  capacidad  Int?
+  ocupados   Int      @default(0)
+  estado     String   @default("ACTIVA") // 'ACTIVA' | 'SATURADA' | 'MANTENIMIENTO'
+  direccion  String?
+  notas      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  contratos Contrato[]
+
+  @@map("puntos_red")
+}
+
+model Plan {
+  id           String       @id @default(uuid())
+  nombre       String
+  tipoServicio TipoServicio
+  mbps         Int?
+  precio       Decimal      @db.Decimal(10, 2)
+  activo       Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  contratos Contrato[]
+  ordenes   OrdenServicio[]
+
+  @@map("planes")
+}
+
+model Contrato {
+  id        String   @id @default(uuid())
+  numero    String   @unique
+
+  clienteId String
+  cliente   Cliente  @relation(fields: [clienteId], references: [id])
+
+  direccion  String
+  referencia String?
+  sector     String?
+
+  tipoServicio TipoServicio
+  ipWan        String?
+  mascara      String?
+  gateway      String?
+
+  latitud  Float?
+  longitud Float?
+
+  precinto String?
+
+  planId String?
+  plan   Plan?   @relation(fields: [planId], references: [id])
+  mbps   Int?
+
+  costoMensual Decimal? @db.Decimal(10, 2)
+  diaCorte     Int?
+
+  puntoRedId String?
+  puntoRed   PuntoRed? @relation(fields: [puntoRedId], references: [id])
+
+  equipoProductoId Int?
+  equipoProducto   Producto? @relation(fields: [equipoProductoId], references: [id])
+  equipoSerie      String?
+
+  tecnicoInstaladorId String?
+  tecnicoInstalador   Tecnico? @relation(fields: [tecnicoInstaladorId], references: [id])
+  fechaInstalacion    DateTime?
+
+  estado     EstadoContrato @default(ACTIVO)
+  motivoBaja String?
+  fechaBaja  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  ordenes OrdenServicio[]
+  cargos  CargoMensual[]
+
+  @@index([clienteId])
+  @@index([puntoRedId])
+  @@map("contratos")
+}
+
+enum EstadoCargo {
+  PENDIENTE
+  PAGADO
+  ANULADO
+}
+
+enum MetodoPago {
+  EFECTIVO
+  YAPE
+  PLIN
+  TRANSFERENCIA
+  TARJETA
+}
+
+model CargoMensual {
+  id         String      @id @default(uuid())
+  contratoId String
+  contrato   Contrato    @relation(fields: [contratoId], references: [id])
+  periodo    String      // 'YYYY-MM'
+  monto      Decimal     @db.Decimal(10, 2)
+  vencimiento DateTime
+  estado     EstadoCargo @default(PENDIENTE)
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  pagos PagoCargo[]
+
+  @@unique([contratoId, periodo])
+  @@index([contratoId])
+  @@map("cargos_mensuales")
+}
+
+model Pago {
+  id          String     @id @default(uuid())
+  fecha       DateTime
+  monto       Decimal    @db.Decimal(10, 2)
+  metodoPago  MetodoPago
+  observacion String?
+  usuarioId   String
+  usuario     Usuario    @relation(fields: [usuarioId], references: [id])
+  createdAt   DateTime   @default(now())
+
+  cargos PagoCargo[]
+
+  @@map("pagos")
+}
+
+model PagoCargo {
+  id      String       @id @default(uuid())
+  pagoId  String
+  pago    Pago         @relation(fields: [pagoId], references: [id], onDelete: Cascade)
+  cargoId String
+  cargo   CargoMensual @relation(fields: [cargoId], references: [id])
+  monto   Decimal      @db.Decimal(10, 2)
+
+  @@unique([cargoId])
+  @@index([pagoId])
+  @@map("pago_cargos")
+}
+
+model OrdenServicio {
+  id        String    @id @default(uuid())
+  nServicio String    @unique
+
+  contratoId String?
+  contrato   Contrato? @relation(fields: [contratoId], references: [id])
+
+  tipoOrden TipoOrden
+  estado    EstadoOrden @default(PENDIENTE)
+
+  fechaServicio DateTime
+
+  abonado    String
+  dni        String?
+  direccion  String
+  referencia String?
+  sector     String?
+  celular    String?
+
+  observacion String?
+
+  tecnicoId       String?
+  tecnico         Tecnico?  @relation(fields: [tecnicoId], references: [id])
+  fechaAsignacion DateTime?
+  fechaAceptacion DateTime?
+  fechaInicio     DateTime?
+  fechaFin        DateTime?
+  tiempoInstalacion Int?
+
+  ipWan   String?
+  mascara String?
+  gateway String?
+
+  latitud  Float?
+  longitud Float?
+  precinto String?
+
+  mensualidad Decimal? @db.Decimal(10, 2)
+  mbps        Int?
+  planId      String?
+  plan        Plan?    @relation(fields: [planId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  consumos OrdenConsumo[]
+
+  @@index([contratoId])
+  @@map("ordenes_servicio")
+}
+
+model OrdenConsumo {
+  id         String        @id @default(uuid())
+  ordenId    String
+  orden      OrdenServicio @relation(fields: [ordenId], references: [id], onDelete: Cascade)
+  productoId Int
+  producto   Producto      @relation(fields: [productoId], references: [id])
+  cantidad   Float
+  createdAt  DateTime      @default(now())
+
+  @@index([ordenId])
+  @@map("orden_consumos")
+}
+
+enum TipoMetodoPago {
+  YAPE
+  PLIN
+  CUENTA_BANCARIA
+}
+
+model Empresa {
+  id        String  @id @default(uuid())
+  ruc       String?
+  nombre    String?
+  direccion String?
+  telefono  String?
+  agencia   String?
+  logo      String? @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  metodosPago MetodoPagoEmpresa[]
+
+  @@map("empresa")
+}
+
+model MetodoPagoEmpresa {
+  id        String         @id @default(uuid())
+  empresaId String
+  empresa   Empresa        @relation(fields: [empresaId], references: [id], onDelete: Cascade)
+
+  tipo    TipoMetodoPago
+  numero  String
+  banco   String?
+  titular String?
+
+  createdAt DateTime @default(now())
+
+  @@index([empresaId])
+  @@map("metodos_pago_empresa")
+}
+
+model Egreso {
+  id          String   @id @default(uuid())
+  concepto    String
+  categoria   String?
+  monto       Decimal  @db.Decimal(10, 2)
+  fecha       DateTime
+  observacion String?
+
+  usuarioId String
+  usuario   Usuario @relation(fields: [usuarioId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([fecha])
+  @@map("egresos")
 }
