@@ -6,12 +6,12 @@ async function main() {
   const passwordHash = await bcrypt.hash('Admin123!', 10);
 
   const admin = await prisma.usuario.upsert({
-    where: { email: 'admin.prointelco@prointelco.com' },
+    where: { email: 'admin@sistema.com' },
     update: {},
     create: {
       nombre: 'Admin',
       apellido: 'Principal',
-      email: 'admin.prointelco@prointelco.com',
+      email: 'admin@sistema.com',
       password: passwordHash,
       rol: 'ADMIN',
       activo: true,

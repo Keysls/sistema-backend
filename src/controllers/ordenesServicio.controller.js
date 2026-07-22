@@ -1,4 +1,5 @@
 const prisma = require('../utils/prisma');
+const { generarCargoProrrateado } = require('../utils/generarCargos');
 
 const ESTADOS = ['PENDIENTE', 'ASIGNADA', 'EN_PROCESO', 'COMPLETADA', 'CANCELADA'];
 const TIPOS_ORDEN = [
@@ -171,9 +172,11 @@ async function cambiarEstado(req, res) {
     if (estado === 'EN_PROCESO') data.fechaInicio = new Date();
 
     const esInstalacion = ordenActual.tipoOrden.startsWith('INSTALACION');
+    let fechaInstalacionFinal = null;
     if (estado === 'COMPLETADA') {
       data.fechaFin = new Date();
-      if (esInstalacion && ordenActual.contratoId && (puntoRedId || equipoProductoId || equipoSerie)) {
+      if (esInstalacion && ordenActual.contratoId) {
+        fechaInstalacionFinal = fechaInstalacion ? new Date(fechaInstalacion) : new Date();
         await prisma.contrato.update({
           where: { id: ordenActual.contratoId },
           data: {
@@ -181,13 +184,22 @@ async function cambiarEstado(req, res) {
             equipoProductoId: equipoProductoId ? Number(equipoProductoId) : undefined,
             equipoSerie: equipoSerie?.trim() || undefined,
             tecnicoInstaladorId: ordenActual.tecnicoId || undefined,
-            fechaInstalacion: fechaInstalacion ? new Date(fechaInstalacion) : new Date(),
+            fechaInstalacion: fechaInstalacionFinal,
           },
         });
       }
     }
 
     const orden = await prisma.ordenServicio.update({ where: { id }, data, include: INCLUDE_ORDEN });
+
+    if (fechaInstalacionFinal && ordenActual.contratoId) {
+      const contrato = await prisma.contrato.findUnique({ where: { id: ordenActual.contratoId } });
+      if (contrato?.estado === 'ACTIVO') {
+        await generarCargoProrrateado(contrato, fechaInstalacionFinal)
+          .catch(err => console.error('Error al generar el cargo prorrateado:', err));
+      }
+    }
+
     res.json(orden);
   } catch (err) {
     if (err.code === 'P2025') return res.status(404).json({ error: 'Orden de servicio no encontrada' });

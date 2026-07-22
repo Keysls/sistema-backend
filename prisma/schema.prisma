@@ -308,8 +308,10 @@ model Contrato {
 
 enum EstadoCargo {
   PENDIENTE
+  PARCIAL
   PAGADO
   ANULADO
+  EXONERADO
 }
 
 enum MetodoPago {
@@ -328,6 +330,7 @@ model CargoMensual {
   monto      Decimal     @db.Decimal(10, 2)
   vencimiento DateTime
   estado     EstadoCargo @default(PENDIENTE)
+  nota       String?
   createdAt  DateTime    @default(now())
   updatedAt  DateTime    @updatedAt
 
@@ -361,8 +364,8 @@ model PagoCargo {
   cargo   CargoMensual @relation(fields: [cargoId], references: [id])
   monto   Decimal      @db.Decimal(10, 2)
 
-  @@unique([cargoId])
   @@index([pagoId])
+  @@index([cargoId])
   @@map("pago_cargos")
 }
 

@@ -12,7 +12,7 @@ const INCLUDE_PAGO = {
     include: {
       cargo: {
         select: {
-          id: true, periodo: true, monto: true, vencimiento: true,
+          id: true, periodo: true, monto: true, vencimiento: true, estado: true,
           contrato: {
             select: {
               id: true, numero: true, tipoServicio: true, direccion: true,
@@ -31,14 +31,17 @@ function fmtPeriodoLabel(periodo) {
   return `${nombres[Number(mes) - 1]} ${anio}`;
 }
 
-// GET /api/pagos?q=&metodoPago=&fechaDesde=&fechaHasta=
+// GET /api/pagos?q=&metodoPago=&fechaDesde=&fechaHasta=&contratoId=
 async function listar(req, res) {
   try {
-    const { q, metodoPago, fechaDesde, fechaHasta } = req.query;
+    const { q, metodoPago, fechaDesde, fechaHasta, contratoId } = req.query;
     const where = {
       ...(metodoPago ? { metodoPago } : {}),
       ...(fechaDesde || fechaHasta
         ? { fecha: { ...(fechaDesde ? { gte: new Date(fechaDesde) } : {}), ...(fechaHasta ? { lte: new Date(fechaHasta + 'T23:59:59') } : {}) } }
+        : {}),
+      ...(contratoId
+        ? { cargos: { some: { cargo: { contratoId } } } }
         : {}),
       ...(q
         ? {
@@ -69,9 +72,12 @@ async function listar(req, res) {
 }
 
 // POST /api/pagos
+// El monto pagado no necesita cubrir la totalidad de los cargos seleccionados:
+// se va aplicando en orden (el más antiguo primero) hasta agotar el monto,
+// dejando el último cargo tocado en estado PARCIAL con su saldo restante.
 async function crear(req, res) {
   try {
-    const { contratoId, fecha, metodoPago, cargoIds, observacion } = req.body;
+    const { contratoId, fecha, metodoPago, cargoIds, monto, observacion } = req.body;
 
     if (!contratoId) return res.status(400).json({ error: 'El contrato es requerido' });
     if (!fecha) return res.status(400).json({ error: 'La fecha de pago es requerida' });
@@ -79,31 +85,56 @@ async function crear(req, res) {
     if (!Array.isArray(cargoIds) || cargoIds.length === 0) {
       return res.status(400).json({ error: 'Selecciona al menos un período (mes) a pagar' });
     }
+    if (!(Number(monto) > 0)) return res.status(400).json({ error: 'El monto a pagar debe ser mayor a 0' });
 
-    const cargos = await prisma.cargoMensual.findMany({
-      where: { id: { in: cargoIds }, contratoId, estado: 'PENDIENTE' },
+    const cargosEncontrados = await prisma.cargoMensual.findMany({
+      where: { id: { in: cargoIds }, contratoId, estado: { in: ['PENDIENTE', 'PARCIAL'] } },
+      include: { pagos: { select: { monto: true } } },
     });
 
-    if (cargos.length !== cargoIds.length) {
+    if (cargosEncontrados.length !== cargoIds.length) {
       return res.status(409).json({ error: 'Alguno de los períodos seleccionados ya fue pagado o no existe. Actualiza la página e intenta de nuevo.' });
     }
 
-    const montoTotal = cargos.reduce((sum, c) => sum + Number(c.monto), 0);
+    // Se respeta el orden enviado por el frontend (debe ser cronológico: el más antiguo primero)
+    const cargosPorId = new Map(cargosEncontrados.map(c => [c.id, c]));
+    const cargosOrdenados = cargoIds.map(id => cargosPorId.get(id));
+
+    const conSaldo = cargosOrdenados.map(c => ({
+      ...c,
+      saldo: Number(c.monto) - c.pagos.reduce((s, p) => s + Number(p.monto), 0),
+    }));
+
+    const montoTotalIngresado = Number(monto);
+    const saldoTotalSeleccionado = conSaldo.reduce((s, c) => s + c.saldo, 0);
+    if (montoTotalIngresado > saldoTotalSeleccionado + 0.009) {
+      return res.status(400).json({ error: `El monto ingresado (S/ ${montoTotalIngresado.toFixed(2)}) supera la deuda seleccionada (S/ ${saldoTotalSeleccionado.toFixed(2)})` });
+    }
 
     const pago = await prisma.$transaction(async (tx) => {
       const nuevoPago = await tx.pago.create({
         data: {
           fecha: new Date(fecha),
-          monto: montoTotal,
+          monto: montoTotalIngresado,
           metodoPago,
           observacion: observacion?.trim() || null,
           usuarioId: req.usuario.id,
         },
       });
 
-      for (const c of cargos) {
-        await tx.pagoCargo.create({ data: { pagoId: nuevoPago.id, cargoId: c.id, monto: c.monto } });
-        await tx.cargoMensual.update({ where: { id: c.id }, data: { estado: 'PAGADO' } });
+      let restante = montoTotalIngresado;
+      for (const c of conSaldo) {
+        if (restante <= 0.004) break;
+        const aplicado = Math.min(c.saldo, restante);
+        if (aplicado <= 0.004) continue;
+
+        await tx.pagoCargo.create({ data: { pagoId: nuevoPago.id, cargoId: c.id, monto: aplicado } });
+        const nuevoSaldo = Math.round((c.saldo - aplicado) * 100) / 100;
+        await tx.cargoMensual.update({
+          where: { id: c.id },
+          data: { estado: nuevoSaldo <= 0.004 ? 'PAGADO' : 'PARCIAL' },
+        });
+        restante = Math.round((restante - aplicado) * 100) / 100;
       }
 
       return tx.pago.findUnique({ where: { id: nuevoPago.id }, include: INCLUDE_PAGO });
@@ -137,6 +168,15 @@ async function comprobante(req, res) {
       prisma.pago.count(),
     ]);
     if (!pago) return res.status(404).json({ error: 'Pago no encontrado' });
+
+    // Para los cargos que quedaron en PARCIAL, calculamos cuánto se debe todavía
+    // (monto del cargo menos la suma de TODOS los pagos aplicados a ese cargo, no solo este).
+    const cargosParciales = pago.cargos.filter(pc => pc.cargo.estado === 'PARCIAL').map(pc => pc.cargo.id);
+    const saldosPorCargo = {};
+    if (cargosParciales.length > 0) {
+      const sumas = await prisma.pagoCargo.groupBy({ by: ['cargoId'], where: { cargoId: { in: cargosParciales } }, _sum: { monto: true } });
+      for (const s of sumas) saldosPorCargo[s.cargoId] = Number(s._sum.monto || 0);
+    }
 
     const primerCargo = pago.cargos[0]?.cargo;
     const contrato = primerCargo?.contrato;
@@ -216,6 +256,7 @@ async function comprobante(req, res) {
     doc.moveDown(0.3);
     doc.font('Helvetica').fontSize(9);
 
+    let hayParciales = false;
     pago.cargos.forEach(pc => {
       const servicio = SERVICIO_LABEL[contrato?.tipoServicio] || '';
       const { inicio, fin } = rangoPeriodo(pc.cargo.periodo);
@@ -227,6 +268,14 @@ async function comprobante(req, res) {
       const yTrasDesc = doc.y;
       doc.text(`${Number(pc.monto).toFixed(2)}`, colImpX, yInicio, { width: 60, align: 'right' });
       doc.y = Math.max(yTrasDesc, yInicio + doc.currentLineHeight());
+
+      if (pc.cargo.estado === 'PARCIAL') {
+        hayParciales = true;
+        const saldoPendiente = Number(pc.cargo.monto) - (saldosPorCargo[pc.cargo.id] || 0);
+        doc.font('Helvetica').fontSize(7.5).fillColor('#B45309')
+          .text(`Pago parcial — saldo pendiente de este mes: S/ ${saldoPendiente.toFixed(2)}`, colDescX, doc.y, { width: anchoUtil });
+        doc.fillColor('#000').fontSize(9);
+      }
       doc.moveDown(0.2);
     });
 

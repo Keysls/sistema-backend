@@ -1,4 +1,5 @@
 const prisma = require('../utils/prisma');
+const { estaVencido } = require('../utils/generarCargos');
 
 const TIPOS_SERVICIO = ['INTERNET', 'CABLE', 'DUO'];
 const ESTADOS = ['ACTIVO', 'SUSPENDIDO', 'CORTADO', 'BAJA'];
@@ -78,21 +79,25 @@ async function listar(req, res) {
       include: {
         ...INCLUDE_CONTRATO,
         ordenes: { orderBy: { fechaServicio: 'desc' }, take: 1, select: { fechaServicio: true, tipoOrden: true } },
-        cargos: { where: { estado: 'PENDIENTE' }, select: { monto: true, periodo: true } },
+        cargos: {
+          where: { estado: { in: ['PENDIENTE', 'PARCIAL'] } },
+          select: { monto: true, periodo: true, pagos: { select: { monto: true } } },
+        },
       },
       orderBy: { createdAt: 'desc' },
     });
 
-    const periodoActual = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`;
-
-    const conActividad = data.map(({ ordenes, cargos, ...c }) => ({
-      ...c,
-      ultimaActividad: ordenes[0]?.fechaServicio || c.createdAt,
-      ultimoTipoOrden: ordenes[0]?.tipoOrden || null,
-      deudaPendiente: cargos.reduce((sum, cg) => sum + Number(cg.monto), 0),
-      mesesPendientes: cargos.length,
-      deudaVencida: cargos.some(cg => cg.periodo < periodoActual),
-    }));
+    const conActividad = data.map(({ ordenes, cargos, ...c }) => {
+      const saldos = cargos.map(cg => Number(cg.monto) - cg.pagos.reduce((s, p) => s + Number(p.monto), 0));
+      return {
+        ...c,
+        ultimaActividad: ordenes[0]?.fechaServicio || c.createdAt,
+        ultimoTipoOrden: ordenes[0]?.tipoOrden || null,
+        deudaPendiente: saldos.reduce((sum, s) => sum + s, 0),
+        mesesPendientes: cargos.length,
+        deudaVencida: cargos.some(cg => estaVencido(cg.periodo, c.diaCorte)),
+      };
+    });
 
     res.json(conActividad);
   } catch (err) {
@@ -216,6 +221,10 @@ async function crear(req, res) {
 
     await crearOrdenInstalacion(contrato);
 
+    // El cargo prorrateado ya NO se genera aquí: se genera cuando la orden de
+    // instalación queda COMPLETADA (ver ordenesServicio.controller.js), tomando
+    // como fecha de inicio la fecha real de instalación, no la de creación del contrato.
+
     res.status(201).json(contrato);
   } catch (err) {
     if (err.code === 'P2002') return res.status(409).json({ error: 'Ya existe un contrato con ese número' });
@@ -248,4 +257,99 @@ async function actualizar(req, res) {
   }
 }
 
-module.exports = { listar, listarMapa, obtener, crear, actualizar };
+// POST /api/contratos/importar  (importación masiva desde la plantilla de Excel)
+// body: { filas: [{ contrato, docIdentidad, abonado, direccion, referencia, sector, tipoServicio, nombrePlan, diaCorte, telefono, cintillo, puntoRed }] }
+async function importarLote(req, res) {
+  const filas = Array.isArray(req.body.filas) ? req.body.filas : [];
+  const creados = [];
+  const omitidos = [];
+  const errores = [];
+
+  for (let i = 0; i < filas.length; i++) {
+    const fila = filas[i];
+    const numeroFila = i + 2; // +2: fila 1 es el encabezado en el Excel
+    try {
+      const numero = String(fila.contrato || '').trim();
+      if (!numero) { omitidos.push({ fila: numeroFila, motivo: 'Sin número de contrato' }); continue; }
+
+      const yaExiste = await prisma.contrato.findUnique({ where: { numero } });
+      if (yaExiste) { omitidos.push({ fila: numeroFila, motivo: `El contrato ${numero} ya existe` }); continue; }
+
+      const SINONIMOS_SERVICIO = {
+        TV: 'CABLE', CATV: 'CABLE', CABLE: 'CABLE',
+        INTERNET: 'INTERNET', NET: 'INTERNET',
+        DUO: 'DUO', DUAL: 'DUO',
+      };
+      const tipoServicioCrudo = String(fila.tipoServicio || '').trim().toUpperCase();
+      const tipoServicio = SINONIMOS_SERVICIO[tipoServicioCrudo] || tipoServicioCrudo;
+      if (!TIPOS_SERVICIO.includes(tipoServicio)) {
+        errores.push({ fila: numeroFila, motivo: `Tipo de servicio inválido: "${fila.tipoServicio}"` });
+        continue;
+      }
+
+      const sectorTrim = String(fila.sector || '').trim();
+      const direccion = String(fila.direccion || '').trim() || sectorTrim || 'Sin dirección registrada';
+
+      const abonado = String(fila.abonado || '').trim();
+      if (!abonado) { errores.push({ fila: numeroFila, motivo: 'Falta el nombre del abonado' }); continue; }
+
+      const dniRuc = String(fila.docIdentidad || '').trim() || `SINDOC-${numero}`;
+
+      let cliente = await prisma.cliente.findUnique({ where: { dniRuc } });
+      if (!cliente) {
+        cliente = await prisma.cliente.create({
+          data: {
+            dniRuc,
+            nombres: abonado,
+            telefono: String(fila.telefono || '').trim() || null,
+            direccion,
+            activo: true,
+          },
+        });
+      }
+
+      let plan = null;
+      const nombrePlan = String(fila.nombrePlan || '').trim();
+      if (nombrePlan) {
+        plan = await prisma.plan.findFirst({
+          where: { nombre: { equals: nombrePlan, mode: 'insensitive' }, tipoServicio },
+        });
+      }
+
+      let puntoRed = null;
+      const codigoPunto = String(fila.puntoRed || '').trim();
+      if (codigoPunto) {
+        puntoRed = await prisma.puntoRed.findFirst({ where: { codigo: { equals: codigoPunto, mode: 'insensitive' } } });
+      }
+
+      const diaCorte = Number(fila.diaCorte) || null;
+
+      const contrato = await prisma.contrato.create({
+        data: {
+          numero,
+          clienteId: cliente.id,
+          direccion,
+          referencia: String(fila.referencia || '').trim() || null,
+          sector: String(fila.sector || '').trim() || null,
+          tipoServicio,
+          planId: plan?.id || null,
+          mbps: plan?.mbps || null,
+          costoMensual: plan?.precio || null,
+          diaCorte,
+          precinto: String(fila.cintillo || '').trim() || null,
+          puntoRedId: puntoRed?.id || null,
+          estado: 'ACTIVO',
+        },
+      });
+
+      creados.push({ fila: numeroFila, numero: contrato.numero });
+    } catch (err) {
+      console.error(`Error importando fila ${numeroFila}:`, err);
+      errores.push({ fila: numeroFila, motivo: err.message || 'Error desconocido' });
+    }
+  }
+
+  res.json({ totalFilas: filas.length, creados: creados.length, omitidos, errores });
+}
+
+module.exports = { listar, listarMapa, obtener, crear, actualizar, importarLote };

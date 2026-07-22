@@ -9,8 +9,8 @@ async function kpis(req, res) {
 
     const [cargosPendientes, pagosMes, contratosActivos] = await Promise.all([
       prisma.cargoMensual.findMany({
-        where: { estado: 'PENDIENTE' },
-        select: { monto: true, contratoId: true, contrato: { select: { clienteId: true } } },
+        where: { estado: { in: ['PENDIENTE', 'PARCIAL'] } },
+        select: { monto: true, contratoId: true, contrato: { select: { clienteId: true } }, pagos: { select: { monto: true } } },
       }),
       prisma.pago.aggregate({
         where: { fecha: { gte: inicioMes, lt: inicioMesSiguiente } },
@@ -19,7 +19,7 @@ async function kpis(req, res) {
       prisma.contrato.count({ where: { estado: 'ACTIVO' } }),
     ]);
 
-    const deudaTotal = cargosPendientes.reduce((acc, c) => acc + Number(c.monto), 0);
+    const deudaTotal = cargosPendientes.reduce((acc, c) => acc + Number(c.monto) - c.pagos.reduce((s, p) => s + Number(p.monto), 0), 0);
     const clientesConDeuda = new Set(cargosPendientes.map(c => c.contrato?.clienteId)).size;
     const recaudadoMes = Number(pagosMes._sum.monto || 0);
 

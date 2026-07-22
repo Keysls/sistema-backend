@@ -1,4 +1,5 @@
 const prisma = require('../utils/prisma');
+const { generarCargoProrrateado } = require('../utils/generarCargos');
 
 const INCLUDE_ORDEN = {
   contrato: { select: { id: true, numero: true, tipoServicio: true, latitud: true, longitud: true, direccion: true, precinto: true, equipoProductoId: true, equipoSerie: true } },
@@ -197,6 +198,7 @@ async function completarOrden(req, res) {
       };
 
       const ordenActualizada = await tx.ordenServicio.update({ where: { id }, data: dataOrden, include: INCLUDE_ORDEN });
+      const fechaInstalacionFinal = new Date();
 
       if (esInstalacion && orden.contratoId) {
         await tx.contrato.update({
@@ -206,7 +208,7 @@ async function completarOrden(req, res) {
             equipoProductoId: equipoProductoId ? Number(equipoProductoId) : undefined,
             equipoSerie: equipoSerie?.trim() || undefined,
             tecnicoInstaladorId: tecnicoId,
-            fechaInstalacion: new Date(),
+            fechaInstalacion: fechaInstalacionFinal,
             precinto: precinto?.trim() || undefined,
             latitud: latitud !== '' && latitud !== undefined && latitud !== null ? Number(latitud) : undefined,
             longitud: longitud !== '' && longitud !== undefined && longitud !== null ? Number(longitud) : undefined,
@@ -223,10 +225,18 @@ async function completarOrden(req, res) {
         });
       }
 
-      return ordenActualizada;
+      return { ordenActualizada, esInstalacion, contratoId: orden.contratoId, fechaInstalacionFinal };
     });
 
-    res.json(resultado);
+    if (resultado.esInstalacion && resultado.contratoId) {
+      const contrato = await prisma.contrato.findUnique({ where: { id: resultado.contratoId } });
+      if (contrato?.estado === 'ACTIVO') {
+        await generarCargoProrrateado(contrato, resultado.fechaInstalacionFinal)
+          .catch(err => console.error('Error al generar el cargo prorrateado:', err));
+      }
+    }
+
+    res.json(resultado.ordenActualizada);
   } catch (err) {
     console.error('Error en tecnicoPortal.completarOrden:', err);
     res.status(400).json({ error: err.message || 'Error al completar la orden' });
