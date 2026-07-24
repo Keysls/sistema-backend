@@ -191,6 +191,8 @@ CREATE TABLE "contratos" (
     "ipWan" TEXT,
     "mascara" TEXT,
     "gateway" TEXT,
+    "pppoeUsuario" TEXT,
+    "pppoePassword" TEXT,
     "latitud" DOUBLE PRECISION,
     "longitud" DOUBLE PRECISION,
     "precinto" TEXT,
@@ -206,6 +208,7 @@ CREATE TABLE "contratos" (
     "estado" "EstadoContrato" NOT NULL DEFAULT 'ACTIVO',
     "motivoBaja" TEXT,
     "fechaBaja" TIMESTAMP(3),
+    "fechaCorte" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -221,6 +224,7 @@ CREATE TABLE "cargos_mensuales" (
     "vencimiento" TIMESTAMP(3) NOT NULL,
     "estado" "EstadoCargo" NOT NULL DEFAULT 'PENDIENTE',
     "nota" TEXT,
+    "montoOriginal" DECIMAL(10,2),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -274,6 +278,8 @@ CREATE TABLE "ordenes_servicio" (
     "ipWan" TEXT,
     "mascara" TEXT,
     "gateway" TEXT,
+    "pppoeUsuario" TEXT,
+    "pppoePassword" TEXT,
     "latitud" DOUBLE PRECISION,
     "longitud" DOUBLE PRECISION,
     "precinto" TEXT,
@@ -365,6 +371,12 @@ CREATE UNIQUE INDEX "puntos_red_codigo_key" ON "puntos_red"("codigo");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "contratos_numero_key" ON "contratos"("numero");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "contratos_ipWan_key" ON "contratos"("ipWan");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "contratos_pppoeUsuario_key" ON "contratos"("pppoeUsuario");
 
 -- CreateIndex
 CREATE INDEX "contratos_clienteId_idx" ON "contratos"("clienteId");

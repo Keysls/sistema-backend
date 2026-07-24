@@ -12,18 +12,33 @@ const INCLUDE_CONTRATO = {
   tecnicoInstalador: { select: { id: true, nombre: true, apellido: true } },
 };
 
+// No se puede usar orderBy: 'desc' sobre `numero` para hallar "el último": es un
+// campo de texto, así que ordena alfabéticamente y cualquier contrato con un número
+// no estándar (ej. importado o de prueba) puede colar como "mayor" que C00000000123
+// y reventar el correlativo. Por eso se filtran y comparan solo los que sí siguen
+// el formato C########### y se toma el máximo numérico real entre esos.
 async function generarNumero() {
-  const ultimo = await prisma.contrato.findFirst({ orderBy: { numero: 'desc' } });
-  const ultimoNum = ultimo ? parseInt(ultimo.numero.replace(/^C/, ''), 10) : 0;
-  const siguiente = (ultimoNum || 0) + 1;
-  return 'C' + String(siguiente).padStart(11, '0');
+  const candidatos = await prisma.contrato.findMany({ where: { numero: { startsWith: 'C' } }, select: { numero: true } });
+  let max = 0;
+  for (const { numero } of candidatos) {
+    if (/^C\d{11}$/.test(numero)) {
+      const n = parseInt(numero.slice(1), 10);
+      if (n > max) max = n;
+    }
+  }
+  return 'C' + String(max + 1).padStart(11, '0');
 }
 
 async function generarNumeroOrden() {
-  const ultimo = await prisma.ordenServicio.findFirst({ orderBy: { nServicio: 'desc' } });
-  const ultimoNum = ultimo ? parseInt(ultimo.nServicio.replace(/^OS/, ''), 10) : 0;
-  const siguiente = (ultimoNum || 0) + 1;
-  return 'OS' + String(siguiente).padStart(10, '0');
+  const candidatos = await prisma.ordenServicio.findMany({ where: { nServicio: { startsWith: 'OS' } }, select: { nServicio: true } });
+  let max = 0;
+  for (const { nServicio } of candidatos) {
+    if (/^OS\d{10}$/.test(nServicio)) {
+      const n = parseInt(nServicio.slice(2), 10);
+      if (n > max) max = n;
+    }
+  }
+  return 'OS' + String(max + 1).padStart(10, '0');
 }
 
 const SUFIJO_SERVICIO = { INTERNET: 'I', CABLE: 'C', DUO: 'D' };
@@ -160,17 +175,20 @@ async function listarMapa(req, res) {
 }
 
 function validarPayload(body) {
-  const { clienteId, direccion, tipoServicio, estado } = body;
+  const { clienteId, direccion, tipoServicio, estado, diaCorte } = body;
   if (!clienteId) return 'El cliente es requerido';
   if (!direccion?.trim()) return 'La dirección es requerida';
   if (!TIPOS_SERVICIO.includes(tipoServicio)) return 'Tipo de servicio inválido';
   if (estado && !ESTADOS.includes(estado)) return 'Estado inválido';
+  const diaCorteNum = Number(diaCorte);
+  if (!diaCorte && diaCorte !== 0) return 'El día de corte es requerido';
+  if (!Number.isInteger(diaCorteNum) || diaCorteNum < 1 || diaCorteNum > 31) return 'El día de corte debe ser un número entre 1 y 31';
   return null;
 }
 
 function armarData(body) {
   const {
-    direccion, referencia, sector, tipoServicio, ipWan, mascara, gateway,
+    direccion, referencia, sector, tipoServicio, ipWan, mascara, gateway, pppoeUsuario, pppoePassword,
     latitud, longitud, precinto, planId, mbps, costoMensual, diaCorte,
     puntoRedId, equipoProductoId, equipoSerie, tecnicoInstaladorId, fechaInstalacion,
     estado, motivoBaja, fechaBaja,
@@ -184,6 +202,8 @@ function armarData(body) {
     ipWan: ipWan?.trim() || null,
     mascara: mascara?.trim() || null,
     gateway: gateway?.trim() || null,
+    pppoeUsuario: pppoeUsuario?.trim() || null,
+    pppoePassword: pppoePassword?.trim() || null,
     latitud: latitud !== '' && latitud !== undefined && latitud !== null ? Number(latitud) : null,
     longitud: longitud !== '' && longitud !== undefined && longitud !== null ? Number(longitud) : null,
     precinto: precinto?.trim() || null,
@@ -202,7 +222,30 @@ function armarData(body) {
   };
 }
 
+// GET /api/contratos/siguiente-numero  (previsualiza qué número le tocaría al próximo
+// contrato — útil para generar el usuario PPPoE antes de guardar. Best-effort: si dos
+// personas crean un contrato al mismo tiempo, el número real puede correrse uno más).
+async function siguienteNumero(req, res) {
+  try {
+    const numero = await generarNumero();
+    res.json({ numero });
+  } catch (err) {
+    console.error('Error en contratos.siguienteNumero:', err);
+    res.status(500).json({ error: 'Error al previsualizar el número de contrato' });
+  }
+}
+
 // POST /api/contratos
+// Traduce un error de restricción única (P2002) de Prisma a un mensaje entendible,
+// según qué campo chocó (numero, ipWan o pppoeUsuario).
+function mensajeDuplicado(err) {
+  const campo = err.meta?.target?.[0] || err.meta?.target;
+  if (campo?.includes('ipWan')) return 'Ya existe otro contrato con esa misma IP WAN';
+  if (campo?.includes('pppoeUsuario')) return 'Ya existe otro contrato con ese mismo usuario PPPoE';
+  if (campo?.includes('numero')) return 'Ya existe un contrato con ese número';
+  return 'Ya existe un contrato con ese dato (debe ser único)';
+}
+
 async function crear(req, res) {
   try {
     const error = validarPayload(req.body);
@@ -227,7 +270,7 @@ async function crear(req, res) {
 
     res.status(201).json(contrato);
   } catch (err) {
-    if (err.code === 'P2002') return res.status(409).json({ error: 'Ya existe un contrato con ese número' });
+    if (err.code === 'P2002') return res.status(409).json({ error: mensajeDuplicado(err) });
     console.error('Error en contratos.crear:', err);
     res.status(500).json({ error: 'Error al crear el contrato' });
   }
@@ -252,8 +295,28 @@ async function actualizar(req, res) {
     res.json(contrato);
   } catch (err) {
     if (err.code === 'P2025') return res.status(404).json({ error: 'Contrato no encontrado' });
+    if (err.code === 'P2002') return res.status(409).json({ error: mensajeDuplicado(err) });
     console.error('Error en contratos.actualizar:', err);
     res.status(500).json({ error: 'Error al actualizar el contrato' });
+  }
+}
+
+// DELETE /api/contratos/:id  (solo ADMIN — borra el contrato y todo lo asociado)
+async function eliminar(req, res) {
+  try {
+    const { id } = req.params;
+    const contrato = await prisma.contrato.findUnique({ where: { id } });
+    if (!contrato) return res.status(404).json({ error: 'Contrato no encontrado' });
+
+    await prisma.pagoCargo.deleteMany({ where: { cargo: { contratoId: id } } });
+    await prisma.cargoMensual.deleteMany({ where: { contratoId: id } });
+    await prisma.ordenServicio.deleteMany({ where: { contratoId: id } });
+    await prisma.contrato.delete({ where: { id } });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Error en contratos.eliminar:', err);
+    res.status(500).json({ error: 'Error al eliminar el contrato' });
   }
 }
 
@@ -338,6 +401,11 @@ async function importarLote(req, res) {
           diaCorte,
           precinto: String(fila.cintillo || '').trim() || null,
           puntoRedId: puntoRed?.id || null,
+          ipWan: String(fila.ipWan || '').trim() || null,
+          mascara: String(fila.mascara || '').trim() || null,
+          gateway: String(fila.gateway || '').trim() || null,
+          pppoeUsuario: String(fila.pppoeUsuario || '').trim() || null,
+          pppoePassword: String(fila.pppoePassword || '').trim() || null,
           estado: 'ACTIVO',
         },
       });
@@ -345,11 +413,11 @@ async function importarLote(req, res) {
       creados.push({ fila: numeroFila, numero: contrato.numero });
     } catch (err) {
       console.error(`Error importando fila ${numeroFila}:`, err);
-      errores.push({ fila: numeroFila, motivo: err.message || 'Error desconocido' });
+      errores.push({ fila: numeroFila, motivo: err.code === 'P2002' ? mensajeDuplicado(err) : (err.message || 'Error desconocido') });
     }
   }
 
   res.json({ totalFilas: filas.length, creados: creados.length, omitidos, errores });
 }
 
-module.exports = { listar, listarMapa, obtener, crear, actualizar, importarLote };
+module.exports = { listar, listarMapa, obtener, crear, actualizar, eliminar, importarLote, siguienteNumero };

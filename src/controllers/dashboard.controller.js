@@ -126,4 +126,41 @@ async function historial(req, res) {
   }
 }
 
-module.exports = { kpis, analitica, historial };
+// GET /api/dashboard/servicios  (cuántos contratos activos hay por tipo de servicio y por plan)
+async function servicios(req, res) {
+  try {
+    const contratos = await prisma.contrato.findMany({
+      where: { estado: 'ACTIVO' },
+      select: { tipoServicio: true, plan: { select: { nombre: true } } },
+    });
+
+    const porTipo = { INTERNET: 0, CABLE: 0, DUO: 0 };
+    const conteoPlanes = new Map();
+    for (const c of contratos) {
+      porTipo[c.tipoServicio] = (porTipo[c.tipoServicio] || 0) + 1;
+      const nombrePlan = c.plan?.nombre || 'Sin plan';
+      conteoPlanes.set(nombrePlan, (conteoPlanes.get(nombrePlan) || 0) + 1);
+    }
+
+    const porPlan = Array.from(conteoPlanes.entries())
+      .map(([plan, cantidad]) => ({ plan, cantidad }))
+      .sort((a, b) => b.cantidad - a.cantidad);
+
+    res.json({
+      data: {
+        total: contratos.length,
+        porTipo: [
+          { tipo: 'INTERNET', label: 'Internet', cantidad: porTipo.INTERNET },
+          { tipo: 'CABLE', label: 'Cable', cantidad: porTipo.CABLE },
+          { tipo: 'DUO', label: 'Dúo', cantidad: porTipo.DUO },
+        ],
+        porPlan,
+      },
+    });
+  } catch (err) {
+    console.error('Error en dashboard.servicios:', err);
+    res.status(500).json({ error: 'Error al obtener la distribución de servicios' });
+  }
+}
+
+module.exports = { kpis, analitica, historial, servicios };

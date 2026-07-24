@@ -14,17 +14,47 @@ const TIPOS_ORDEN = [
   'RETIRO_EQUIPO_D', 'TRASLADO_D', 'BAJA_SERVICIO_D',
 ];
 
+// Al completar una orden de este tipo (sin el sufijo _I/_C/_D), el contrato
+// relacionado cambia automáticamente a este estado.
+const ESTADO_CONTRATO_POR_TIPO = {
+  CORTE_SOLICITUD: 'CORTADO',
+  CORTE_DEUDA: 'CORTADO',
+  BAJA_SERVICIO: 'BAJA',
+  RECONEXION: 'ACTIVO',
+};
+
+// Descuenta 1 unidad de stock del equipo (ONU/decodificador) asignado a una
+// instalación/cambio de equipo. Lanza un error (bloquea la orden) si no hay stock.
+async function descontarEquipoDeInventario(productoId) {
+  const producto = await prisma.producto.findUnique({ where: { id: Number(productoId) } });
+  if (!producto) throw new Error('El equipo seleccionado no existe en el catálogo');
+  if (producto.esMedible) return; // los productos medibles se descuentan por consumos, no por unidad de equipo
+  if (producto.stockTotal < 1) throw new Error(`Sin stock de "${producto.nombre}" para asignar como equipo`);
+  await prisma.producto.update({ where: { id: producto.id }, data: { stockTotal: { decrement: 1 } } });
+  await prisma.movimientoStock.create({
+    data: { productoId: producto.id, tipo: 'SALIDA', cantidad: 1, motivo: 'Equipo asignado en orden de servicio' },
+  });
+}
+
 const INCLUDE_ORDEN = {
-  contrato: { select: { id: true, numero: true, tipoServicio: true } },
+  contrato: { select: { id: true, numero: true, tipoServicio: true, estado: true } },
   tecnico: { select: { id: true, nombre: true, apellido: true } },
   plan: true,
 };
 
+// Igual que en contratos.controller.js: `nServicio` es texto, así que no se puede
+// ordenar desc y confiar en que el primero sea el "mayor" numéricamente — se filtran
+// solo los que siguen el formato OS########## y se toma el máximo real entre esos.
 async function generarNumero() {
-  const ultimo = await prisma.ordenServicio.findFirst({ orderBy: { nServicio: 'desc' } });
-  const ultimoNum = ultimo ? parseInt(ultimo.nServicio.replace(/^OS/, ''), 10) : 0;
-  const siguiente = (ultimoNum || 0) + 1;
-  return 'OS' + String(siguiente).padStart(10, '0');
+  const candidatos = await prisma.ordenServicio.findMany({ where: { nServicio: { startsWith: 'OS' } }, select: { nServicio: true } });
+  let max = 0;
+  for (const { nServicio } of candidatos) {
+    if (/^OS\d{10}$/.test(nServicio)) {
+      const n = parseInt(nServicio.slice(2), 10);
+      if (n > max) max = n;
+    }
+  }
+  return 'OS' + String(max + 1).padStart(10, '0');
 }
 
 // GET /api/ordenes-servicio?q=&estado=&tipoOrden=&tecnicoId=&grupo=I|C|D
@@ -83,7 +113,7 @@ function armarData(body) {
   const {
     contratoId, tipoOrden, estado, fechaServicio, abonado, dni, direccion, referencia, sector, celular,
     observacion, tecnicoId, fechaAsignacion, fechaInicio, fechaFin, tiempoInstalacion,
-    ipWan, mascara, gateway, mensualidad, mbps, planId,
+    ipWan, mascara, gateway, pppoeUsuario, pppoePassword, mensualidad, mbps, planId,
   } = body;
 
   return {
@@ -106,6 +136,8 @@ function armarData(body) {
     ipWan: ipWan?.trim() || null,
     mascara: mascara?.trim() || null,
     gateway: gateway?.trim() || null,
+    pppoeUsuario: pppoeUsuario?.trim() || null,
+    pppoePassword: pppoePassword?.trim() || null,
     mensualidad: mensualidad !== '' && mensualidad !== undefined && mensualidad !== null ? Number(mensualidad) : null,
     mbps: mbps !== '' && mbps !== undefined && mbps !== null ? Number(mbps) : null,
     planId: planId || null,
@@ -162,6 +194,9 @@ async function cambiarEstado(req, res) {
 
     const ordenActual = await prisma.ordenServicio.findUnique({ where: { id } });
     if (!ordenActual) return res.status(404).json({ error: 'Orden de servicio no encontrada' });
+    if (ordenActual.estado === 'COMPLETADA') {
+      return res.status(400).json({ error: 'Esta orden ya está completada y no se puede modificar' });
+    }
 
     const data = { estado };
     if (estado === 'ASIGNADA') {
@@ -172,11 +207,45 @@ async function cambiarEstado(req, res) {
     if (estado === 'EN_PROCESO') data.fechaInicio = new Date();
 
     const esInstalacion = ordenActual.tipoOrden.startsWith('INSTALACION');
+    const tipoBase = ordenActual.tipoOrden.replace(/_[ICD]$/, '');
+    const nuevoEstadoContrato = ESTADO_CONTRATO_POR_TIPO[tipoBase] || null;
     let fechaInstalacionFinal = null;
     if (estado === 'COMPLETADA') {
       data.fechaFin = new Date();
+
+      // La IP WAN y el usuario PPPoE de la orden se sincronizan al contrato al
+      // completarla — pero antes se valida que no choquen con otro contrato.
+      if (ordenActual.contratoId && (ordenActual.ipWan || ordenActual.pppoeUsuario)) {
+        if (ordenActual.ipWan) {
+          const otroPorIp = await prisma.contrato.findFirst({
+            where: { ipWan: ordenActual.ipWan, id: { not: ordenActual.contratoId } },
+          });
+          if (otroPorIp) return res.status(409).json({ error: `La IP WAN ${ordenActual.ipWan} ya está en uso por el contrato ${otroPorIp.numero}` });
+        }
+        if (ordenActual.pppoeUsuario) {
+          const otroPorUsuario = await prisma.contrato.findFirst({
+            where: { pppoeUsuario: ordenActual.pppoeUsuario, id: { not: ordenActual.contratoId } },
+          });
+          if (otroPorUsuario) return res.status(409).json({ error: `El usuario PPPoE ${ordenActual.pppoeUsuario} ya está en uso por el contrato ${otroPorUsuario.numero}` });
+        }
+        await prisma.contrato.update({
+          where: { id: ordenActual.contratoId },
+          data: {
+            ipWan: ordenActual.ipWan, mascara: ordenActual.mascara, gateway: ordenActual.gateway,
+            pppoeUsuario: ordenActual.pppoeUsuario, pppoePassword: ordenActual.pppoePassword,
+          },
+        });
+      }
+
       if (esInstalacion && ordenActual.contratoId) {
         fechaInstalacionFinal = fechaInstalacion ? new Date(fechaInstalacion) : new Date();
+        if (equipoProductoId) {
+          try {
+            await descontarEquipoDeInventario(equipoProductoId);
+          } catch (err) {
+            return res.status(409).json({ error: err.message });
+          }
+        }
         await prisma.contrato.update({
           where: { id: ordenActual.contratoId },
           data: {
@@ -185,6 +254,53 @@ async function cambiarEstado(req, res) {
             equipoSerie: equipoSerie?.trim() || undefined,
             tecnicoInstaladorId: ordenActual.tecnicoId || undefined,
             fechaInstalacion: fechaInstalacionFinal,
+          },
+        });
+      } else if (nuevoEstadoContrato && ordenActual.contratoId) {
+        await prisma.contrato.update({
+          where: { id: ordenActual.contratoId },
+          data: {
+            estado: nuevoEstadoContrato,
+            // Al cortar, se guarda cuándo ocurrió para poder ofrecer cobrar los
+            // meses saltados si luego se reconecta. Al reconectar no se borra
+            // aquí — se limpia solo cuando el admin resuelve esos meses saltados.
+            ...(nuevoEstadoContrato === 'CORTADO' ? { fechaCorte: new Date() } : {}),
+          },
+        });
+      } else if (tipoBase === 'CAMBIO_EQUIPO' && ordenActual.contratoId) {
+        if (equipoProductoId) {
+          try {
+            await descontarEquipoDeInventario(equipoProductoId);
+          } catch (err) {
+            return res.status(409).json({ error: err.message });
+          }
+        }
+        await prisma.contrato.update({
+          where: { id: ordenActual.contratoId },
+          data: {
+            equipoProductoId: equipoProductoId ? Number(equipoProductoId) : undefined,
+            equipoSerie: equipoSerie?.trim() || undefined,
+          },
+        });
+      } else if (tipoBase === 'RETIRO_EQUIPO' && ordenActual.contratoId) {
+        // Al retirar el equipo, el contrato deja de tener equipo/precinto asignado.
+        await prisma.contrato.update({
+          where: { id: ordenActual.contratoId },
+          data: { equipoProductoId: null, equipoSerie: null, precinto: null },
+        });
+      } else if (tipoBase === 'CAMBIO_PLAN' && ordenActual.contratoId) {
+        // El plan/mensualidad/mbps nuevos ya se eligieron al crear la orden;
+        // al completarla se trasladan al contrato para que se facture con el plan nuevo.
+        // Si el plan elegido es de otro tipo de servicio (ej. contrato Dúo migrando a
+        // solo Internet), el contrato también cambia de tipoServicio para reflejarlo.
+        const planNuevo = ordenActual.planId ? await prisma.plan.findUnique({ where: { id: ordenActual.planId } }) : null;
+        await prisma.contrato.update({
+          where: { id: ordenActual.contratoId },
+          data: {
+            planId: ordenActual.planId || null,
+            mbps: ordenActual.mbps ?? undefined,
+            costoMensual: ordenActual.mensualidad ?? undefined,
+            ...(planNuevo ? { tipoServicio: planNuevo.tipoServicio } : {}),
           },
         });
       }

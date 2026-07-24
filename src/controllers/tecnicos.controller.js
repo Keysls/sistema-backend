@@ -99,6 +99,11 @@ async function actualizar(req, res) {
     if (err.code === 'P2025') {
       return res.status(404).json({ error: 'Técnico no encontrado' });
     }
+    if (err.code === 'P2002') {
+      const campo = err.meta?.target?.[0] || err.meta?.target;
+      const etiqueta = campo?.includes('email') ? 'correo' : campo?.includes('dni') ? 'DNI' : 'dato';
+      return res.status(409).json({ error: `Ya existe otro técnico con ese ${etiqueta}` });
+    }
     console.error('Error en tecnicos.actualizar:', err);
     res.status(500).json({ error: 'Error al actualizar el técnico' });
   }

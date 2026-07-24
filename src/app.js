@@ -77,6 +77,7 @@ app.use('/api/cargos', require('./routes/cargos.routes'));
 app.use('/api/pagos', require('./routes/pagos.routes'));
 app.use('/api/empresa', require('./routes/empresa.routes'));
 app.use('/api/egresos', require('./routes/egresos.routes'));
+app.use('/api/reportes', require('./routes/reportes.routes'));
 
 
 // ─── 404 ─────────────────────────────────────────────────────────

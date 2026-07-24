@@ -12,7 +12,7 @@ async function previsualizarCargosDelMes() {
   const diaHoy = hoy.getDate();
 
   const contratos = await prisma.contrato.findMany({
-    where: { estado: 'ACTIVO' },
+    where: { estado: 'ACTIVO', fechaInstalacion: { not: null } },
     include: { plan: { select: { precio: true } }, cliente: { select: { nombres: true, apellidos: true } } },
   });
 
@@ -51,7 +51,7 @@ async function generarCargosDelMes({ exonerarIds = [], descuentos = {} } = {}) {
   const setExonerados = new Set(exonerarIds);
 
   const contratos = await prisma.contrato.findMany({
-    where: { estado: 'ACTIVO' },
+    where: { estado: 'ACTIVO', fechaInstalacion: { not: null } },
     include: { plan: { select: { precio: true } } },
   });
 
@@ -139,4 +139,120 @@ function estaVencido(periodo, diaCorte, ahora = new Date()) {
   return ahora > fechaLimitePago(periodo, diaCorte);
 }
 
-module.exports = { generarCargosDelMes, previsualizarCargosDelMes, periodoDe, generarCargoProrrateado, fechaLimitePago, estaVencido };
+// Suma `n` meses a un período 'YYYY-MM' y devuelve el nuevo período en el mismo formato.
+function sumarMeses(periodo, n) {
+  const [anio, mes] = periodo.split('-').map(Number);
+  const fecha = new Date(anio, mes - 1 + n, 1);
+  return periodoDe(fecha);
+}
+
+// Devuelve los períodos (meses) que un contrato se saltó mientras estuvo cortado:
+// desde el mes en que se cortó (contrato.fechaCorte) hasta el mes actual, excluyendo
+// los que ya tienen un CargoMensual creado. Se usa al reconectar, para ofrecer
+// cobrarle esos meses en vez de perderlos silenciosamente.
+async function mesesSaltadosPorCorte(contratoId) {
+  const contrato = await prisma.contrato.findUnique({
+    where: { id: contratoId },
+    include: { plan: { select: { precio: true } } },
+  });
+  if (!contrato || !contrato.fechaCorte) return { periodos: [], monto: 0 };
+
+  const monto = contrato.costoMensual != null ? Number(contrato.costoMensual) : (contrato.plan?.precio != null ? Number(contrato.plan.precio) : 0);
+  if (!monto || monto <= 0) return { periodos: [], monto: 0 };
+
+  const periodoInicio = periodoDe(contrato.fechaCorte);
+  const periodoFin = periodoDe(new Date());
+
+  const periodos = [];
+  let periodoActual = periodoInicio;
+  while (periodoActual <= periodoFin) {
+    const yaExiste = await prisma.cargoMensual.findUnique({
+      where: { contratoId_periodo: { contratoId, periodo: periodoActual } },
+    });
+    if (!yaExiste) periodos.push(periodoActual);
+    periodoActual = sumarMeses(periodoActual, 1);
+  }
+
+  return { periodos, monto };
+}
+
+// Crea el cargo (monto completo, PENDIENTE) de cada período indicado que aún no
+// tenga cargo — usado tras confirmar cuáles de los "meses saltados" se van a cobrar.
+async function generarCargosSaltados(contratoId, periodos) {
+  const contrato = await prisma.contrato.findUnique({
+    where: { id: contratoId },
+    include: { plan: { select: { precio: true } } },
+  });
+  if (!contrato) return { creados: 0 };
+
+  const monto = contrato.costoMensual != null ? Number(contrato.costoMensual) : (contrato.plan?.precio != null ? Number(contrato.plan.precio) : 0);
+  if (!monto || monto <= 0) return { creados: 0 };
+
+  let creados = 0;
+  for (const periodo of periodos) {
+    const [anio, mes] = periodo.split('-').map(Number);
+    const diasEnMes = new Date(anio, mes, 0).getDate();
+    const diaVencimiento = Math.min(contrato.diaCorte || diasEnMes, diasEnMes);
+    const vencimiento = new Date(anio, mes - 1, diaVencimiento);
+
+    const yaExiste = await prisma.cargoMensual.findUnique({
+      where: { contratoId_periodo: { contratoId, periodo } },
+    });
+    if (yaExiste) continue;
+
+    await prisma.cargoMensual.create({
+      data: { contratoId, periodo, monto, vencimiento, estado: 'PENDIENTE', nota: 'Mes cobrado tras reconexión' },
+    });
+    creados++;
+  }
+
+  return { creados };
+}
+
+// Aplica un % de descuento a TODOS los cargos PENDIENTES (sin abonos) de un período
+// dado — por ejemplo, para dar 10% a todos los clientes por Fiestas Patrias en julio.
+// Igual que el descuento individual, siempre calcula desde el monto original guardado,
+// así que se puede volver a llamar con otro % sin ir descontando en cascada, y cada
+// cargo se puede revertir individualmente después con "Quitar descuento".
+async function aplicarDescuentoMasivo(periodo, porcentaje, motivo) {
+  const pct = Number(porcentaje);
+  const cargos = await prisma.cargoMensual.findMany({ where: { periodo, estado: 'PENDIENTE' } });
+
+  let actualizados = 0;
+  for (const cargo of cargos) {
+    const base = cargo.montoOriginal != null ? Number(cargo.montoOriginal) : Number(cargo.monto);
+    const nuevoMonto = Math.round(base * (1 - pct / 100) * 100) / 100;
+    await prisma.cargoMensual.update({
+      where: { id: cargo.id },
+      data: { monto: nuevoMonto, montoOriginal: base, nota: motivo?.trim() || `Descuento ${pct}% aplicado a todos` },
+    });
+    actualizados++;
+  }
+
+  return { actualizados };
+}
+
+// Revierte a TODOS los cargos pendientes de un período que tengan un descuento
+// activo (individual o masivo) de vuelta a su monto original.
+async function quitarDescuentoMasivo(periodo) {
+  const cargos = await prisma.cargoMensual.findMany({
+    where: { periodo, estado: 'PENDIENTE', montoOriginal: { not: null } },
+  });
+
+  let revertidos = 0;
+  for (const cargo of cargos) {
+    await prisma.cargoMensual.update({
+      where: { id: cargo.id },
+      data: { monto: cargo.montoOriginal, montoOriginal: null, nota: null },
+    });
+    revertidos++;
+  }
+
+  return { revertidos };
+}
+
+module.exports = {
+  generarCargosDelMes, previsualizarCargosDelMes, periodoDe, generarCargoProrrateado,
+  fechaLimitePago, estaVencido, mesesSaltadosPorCorte, generarCargosSaltados,
+  aplicarDescuentoMasivo, quitarDescuentoMasivo,
+};

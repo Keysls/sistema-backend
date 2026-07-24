@@ -1,6 +1,26 @@
 const prisma = require('../utils/prisma');
 const { generarCargoProrrateado } = require('../utils/generarCargos');
 
+const ESTADO_CONTRATO_POR_TIPO = {
+  CORTE_SOLICITUD: 'CORTADO',
+  CORTE_DEUDA: 'CORTADO',
+  BAJA_SERVICIO: 'BAJA',
+  RECONEXION: 'ACTIVO',
+};
+
+// Descuenta 1 unidad de stock del equipo (ONU/decodificador) asignado — dentro de
+// una transacción (tx), igual que el mismo helper en ordenesServicio.controller.js.
+async function descontarEquipoDeInventario(tx, productoId) {
+  const producto = await tx.producto.findUnique({ where: { id: Number(productoId) } });
+  if (!producto) throw new Error('El equipo seleccionado no existe en el catálogo');
+  if (producto.esMedible) return;
+  if (producto.stockTotal < 1) throw new Error(`Sin stock de "${producto.nombre}" para asignar como equipo`);
+  await tx.producto.update({ where: { id: producto.id }, data: { stockTotal: { decrement: 1 } } });
+  await tx.movimientoStock.create({
+    data: { productoId: producto.id, tipo: 'SALIDA', cantidad: 1, motivo: 'Equipo asignado en orden de servicio' },
+  });
+}
+
 const INCLUDE_ORDEN = {
   contrato: { select: { id: true, numero: true, tipoServicio: true, latitud: true, longitud: true, direccion: true, precinto: true, equipoProductoId: true, equipoSerie: true } },
   tecnico: { select: { id: true, nombre: true, apellido: true } },
@@ -154,6 +174,19 @@ async function completarOrden(req, res) {
 
     const esInstalacion = orden.tipoOrden.startsWith('INSTALACION');
     const esCambioEquipo = orden.tipoOrden.startsWith('CAMBIO_EQUIPO');
+    const tipoBase = orden.tipoOrden.replace(/_[ICD]$/, '');
+    const nuevoEstadoContrato = ESTADO_CONTRATO_POR_TIPO[tipoBase] || null;
+
+    // Misma validación que en el panel admin: la IP WAN y el usuario PPPoE de la
+    // orden no pueden chocar con los de otro contrato antes de sincronizarlos.
+    if (orden.contratoId && orden.ipWan) {
+      const otroPorIp = await prisma.contrato.findFirst({ where: { ipWan: orden.ipWan, id: { not: orden.contratoId } } });
+      if (otroPorIp) return res.status(409).json({ error: `La IP WAN ${orden.ipWan} ya está en uso por el contrato ${otroPorIp.numero}` });
+    }
+    if (orden.contratoId && orden.pppoeUsuario) {
+      const otroPorUsuario = await prisma.contrato.findFirst({ where: { pppoeUsuario: orden.pppoeUsuario, id: { not: orden.contratoId } } });
+      if (otroPorUsuario) return res.status(409).json({ error: `El usuario PPPoE ${orden.pppoeUsuario} ya está en uso por el contrato ${otroPorUsuario.numero}` });
+    }
 
     const listaConsumos = Array.isArray(consumos) ? consumos.filter(c => c.productoId && Number(c.cantidad) > 0) : [];
 
@@ -200,7 +233,18 @@ async function completarOrden(req, res) {
       const ordenActualizada = await tx.ordenServicio.update({ where: { id }, data: dataOrden, include: INCLUDE_ORDEN });
       const fechaInstalacionFinal = new Date();
 
+      if (orden.contratoId && (orden.ipWan || orden.pppoeUsuario)) {
+        await tx.contrato.update({
+          where: { id: orden.contratoId },
+          data: {
+            ipWan: orden.ipWan, mascara: orden.mascara, gateway: orden.gateway,
+            pppoeUsuario: orden.pppoeUsuario, pppoePassword: orden.pppoePassword,
+          },
+        });
+      }
+
       if (esInstalacion && orden.contratoId) {
+        if (equipoProductoId) await descontarEquipoDeInventario(tx, equipoProductoId);
         await tx.contrato.update({
           where: { id: orden.contratoId },
           data: {
@@ -215,12 +259,32 @@ async function completarOrden(req, res) {
           },
         });
       } else if (esCambioEquipo && orden.contratoId && (equipoProductoId || equipoSerie?.trim())) {
+        if (equipoProductoId) await descontarEquipoDeInventario(tx, equipoProductoId);
         await tx.contrato.update({
           where: { id: orden.contratoId },
           data: {
             equipoProductoId: equipoProductoId ? Number(equipoProductoId) : undefined,
             equipoSerie: equipoSerie?.trim() || undefined,
             precinto: precinto?.trim() || undefined,
+          },
+        });
+      } else if (nuevoEstadoContrato && orden.contratoId) {
+        await tx.contrato.update({
+          where: { id: orden.contratoId },
+          data: { estado: nuevoEstadoContrato, ...(nuevoEstadoContrato === 'CORTADO' ? { fechaCorte: new Date() } : {}) },
+        });
+      } else if (tipoBase === 'RETIRO_EQUIPO' && orden.contratoId) {
+        await tx.contrato.update({
+          where: { id: orden.contratoId },
+          data: { equipoProductoId: null, equipoSerie: null, precinto: null },
+        });
+      } else if (tipoBase === 'CAMBIO_PLAN' && orden.contratoId) {
+        const planNuevo = orden.planId ? await tx.plan.findUnique({ where: { id: orden.planId } }) : null;
+        await tx.contrato.update({
+          where: { id: orden.contratoId },
+          data: {
+            planId: orden.planId || null, mbps: orden.mbps ?? undefined, costoMensual: orden.mensualidad ?? undefined,
+            ...(planNuevo ? { tipoServicio: planNuevo.tipoServicio } : {}),
           },
         });
       }
